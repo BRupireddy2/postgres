@@ -107,10 +107,11 @@ const char *const SlotInvalidationCauses[] = {
 	[RS_INVAL_WAL_REMOVED] = "wal_removed",
 	[RS_INVAL_HORIZON] = "rows_removed",
 	[RS_INVAL_WAL_LEVEL] = "wal_level_insufficient",
+	[RS_INVAL_INACTIVE_TIMEOUT] = "inactive_timeout",
 };
 
 /* Maximum number of invalidation causes */
-#define	RS_INVAL_MAX_CAUSES RS_INVAL_WAL_LEVEL
+#define	RS_INVAL_MAX_CAUSES RS_INVAL_INACTIVE_TIMEOUT
 
 StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 				 "array length mismatch");
@@ -140,6 +141,7 @@ ReplicationSlot *MyReplicationSlot = NULL;
 /* GUC variables */
 int			max_replication_slots = 10; /* the maximum number of replication
 										 * slots */
+int			replication_slot_inactive_timeout = 0;
 
 /*
  * This GUC lists streaming replication standby server slot names that
@@ -158,6 +160,13 @@ static XLogRecPtr ss_oldest_flush_lsn = InvalidXLogRecPtr;
 
 static void ReplicationSlotShmemExit(int code, Datum arg);
 static void ReplicationSlotDropPtr(ReplicationSlot *slot);
+
+static bool InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
+										   ReplicationSlot *s,
+										   XLogRecPtr oldestLSN,
+										   Oid dboid,
+										   TransactionId snapshotConflictHorizon,
+										   bool *invalidated);
 
 /* internal persistency functions */
 static void RestoreSlotFromDisk(const char *name);
@@ -535,12 +544,17 @@ ReplicationSlotName(int index, Name name)
  *
  * An error is raised if nowait is true and the slot is currently in use. If
  * nowait is false, we sleep until the slot is released by the owning process.
+ *
+ * An error is raised if check_for_invalidation is true and the slot gets
+ * invalidated now or has been invalidated previously.
  */
 void
-ReplicationSlotAcquire(const char *name, bool nowait)
+ReplicationSlotAcquire(const char *name, bool nowait,
+					   bool check_for_invalidation)
 {
 	ReplicationSlot *s;
 	int			active_pid;
+	bool		released_lock = false;
 
 	Assert(name != NULL);
 
@@ -614,6 +628,57 @@ retry:
 
 	/* We made this slot active, so it's ours now. */
 	MyReplicationSlot = s;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+
+	/*
+	 * Check if the acquired slot needs to be invalidated. And, error out if
+	 * it gets invalidated now or has been invalidated previously, because
+	 * there's no use in acquiring the invalidated slot.
+	 *
+	 * XXX: Currently we check for inactive_timeout invalidation here. We
+	 * might need to check for other invalidations too.
+	 */
+	if (check_for_invalidation)
+	{
+		bool		invalidated = false;
+
+		released_lock = InvalidatePossiblyObsoleteSlot(RS_INVAL_INACTIVE_TIMEOUT,
+													   s, 0, InvalidOid,
+													   InvalidTransactionId,
+													   &invalidated);
+
+		/*
+		 * If the slot has been invalidated, recalculate the resource limits.
+		 */
+		if (invalidated)
+		{
+			ReplicationSlotsComputeRequiredXmin(false);
+			ReplicationSlotsComputeRequiredLSN();
+		}
+
+		if (s->data.invalidated == RS_INVAL_INACTIVE_TIMEOUT)
+		{
+			/*
+			 * Release the lock if it's not yet to keep the cleanup path on
+			 * error happy.
+			 */
+			if (!released_lock)
+				LWLockRelease(ReplicationSlotControlLock);
+
+			Assert(s->inactive_since > 0);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("can no longer get changes from replication slot \"%s\"",
+							NameStr(s->data.name)),
+					 errdetail("This slot has been invalidated because it was inactive since %s for more than %d seconds specified by \"replication_slot_inactive_timeout\".",
+							   timestamptz_to_str(s->inactive_since),
+							   replication_slot_inactive_timeout)));
+		}
+	}
+
+	if (!released_lock)
+		LWLockRelease(ReplicationSlotControlLock);
 
 	/*
 	 * The call to pgstat_acquire_replslot() protects against stats for a
@@ -785,7 +850,7 @@ ReplicationSlotDrop(const char *name, bool nowait)
 {
 	Assert(MyReplicationSlot == NULL);
 
-	ReplicationSlotAcquire(name, nowait);
+	ReplicationSlotAcquire(name, nowait, false);
 
 	/*
 	 * Do not allow users to drop the slots which are currently being synced
@@ -808,7 +873,7 @@ ReplicationSlotAlter(const char *name, bool failover)
 {
 	Assert(MyReplicationSlot == NULL);
 
-	ReplicationSlotAcquire(name, false);
+	ReplicationSlotAcquire(name, false, true);
 
 	if (SlotIsPhysical(MyReplicationSlot))
 		ereport(ERROR,
@@ -1480,7 +1545,8 @@ ReportSlotInvalidation(ReplicationSlotInvalidationCause cause,
 					   NameData slotname,
 					   XLogRecPtr restart_lsn,
 					   XLogRecPtr oldestLSN,
-					   TransactionId snapshotConflictHorizon)
+					   TransactionId snapshotConflictHorizon,
+					   TimestampTz inactive_since)
 {
 	StringInfoData err_detail;
 	bool		hint = false;
@@ -1509,6 +1575,13 @@ ReportSlotInvalidation(ReplicationSlotInvalidationCause cause,
 
 		case RS_INVAL_WAL_LEVEL:
 			appendStringInfoString(&err_detail, _("Logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary server."));
+			break;
+		case RS_INVAL_INACTIVE_TIMEOUT:
+			Assert(inactive_since > 0);
+			appendStringInfo(&err_detail,
+							 _("The slot has been inactive since %s for more than %d seconds specified by \"replication_slot_inactive_timeout\"."),
+							 timestamptz_to_str(inactive_since),
+							 replication_slot_inactive_timeout);
 			break;
 		case RS_INVAL_NONE:
 			pg_unreachable();
@@ -1553,6 +1626,7 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 	TransactionId initial_catalog_effective_xmin = InvalidTransactionId;
 	XLogRecPtr	initial_restart_lsn = InvalidXLogRecPtr;
 	ReplicationSlotInvalidationCause invalidation_cause_prev PG_USED_FOR_ASSERTS_ONLY = RS_INVAL_NONE;
+	TimestampTz inactive_since = 0;
 
 	for (;;)
 	{
@@ -1560,6 +1634,7 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 		NameData	slotname;
 		int			active_pid = 0;
 		ReplicationSlotInvalidationCause invalidation_cause = RS_INVAL_NONE;
+		TimestampTz now = 0;
 
 		Assert(LWLockHeldByMeInMode(ReplicationSlotControlLock, LW_SHARED));
 
@@ -1568,6 +1643,18 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 			if (released_lock)
 				LWLockRelease(ReplicationSlotControlLock);
 			break;
+		}
+
+		if (cause == RS_INVAL_INACTIVE_TIMEOUT &&
+			(replication_slot_inactive_timeout > 0 &&
+			 s->inactive_since > 0 &&
+			 !(RecoveryInProgress() && s->data.synced)))
+		{
+			/*
+			 * We get the current time beforehand to avoid system call while
+			 * holding the spinlock.
+			 */
+			now = GetCurrentTimestamp();
 		}
 
 		/*
@@ -1623,6 +1710,39 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 					if (SlotIsLogical(s))
 						invalidation_cause = cause;
 					break;
+				case RS_INVAL_INACTIVE_TIMEOUT:
+
+					/*
+					 * Quick exit if inactive timeout invalidation mechanism
+					 * is disabled or slot is currently being used or the slot
+					 * on standby is currently being synced from the primary.
+					 *
+					 * Note that we don't invalidate synced slots because,
+					 * they are typically considered not active as they don't
+					 * perform logical decoding to produce the changes.
+					 */
+					if (replication_slot_inactive_timeout == 0 ||
+						s->inactive_since == 0 ||
+						(RecoveryInProgress() && s->data.synced))
+						break;
+
+					/*
+					 * Check if the slot needs to be invalidated due to
+					 * replication_slot_inactive_timeout GUC.
+					 */
+					if (TimestampDifferenceExceeds(s->inactive_since, now,
+												   replication_slot_inactive_timeout * 1000))
+					{
+						invalidation_cause = cause;
+						inactive_since = s->inactive_since;
+
+						/*
+						 * Invalidation due to inactive timeout implies that
+						 * no one is using the slot.
+						 */
+						Assert(s->active_pid == 0);
+					}
+					break;
 				case RS_INVAL_NONE:
 					pg_unreachable();
 			}
@@ -1648,11 +1768,14 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 		active_pid = s->active_pid;
 
 		/*
-		 * If the slot can be acquired, do so and mark it invalidated
-		 * immediately.  Otherwise we'll signal the owning process, below, and
-		 * retry.
+		 * If the slot can be acquired, do so or if the slot is already ours,
+		 * then mark it invalidated.  Otherwise we'll signal the owning
+		 * process, below, and retry.
 		 */
-		if (active_pid == 0)
+		if (active_pid == 0 ||
+			(MyReplicationSlot != NULL &&
+			 MyReplicationSlot == s &&
+			 active_pid == MyProcPid))
 		{
 			MyReplicationSlot = s;
 			s->active_pid = MyProcPid;
@@ -1707,7 +1830,8 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 			{
 				ReportSlotInvalidation(invalidation_cause, true, active_pid,
 									   slotname, restart_lsn,
-									   oldestLSN, snapshotConflictHorizon);
+									   oldestLSN, snapshotConflictHorizon,
+									   inactive_since);
 
 				if (MyBackendType == B_STARTUP)
 					(void) SendProcSignal(active_pid,
@@ -1753,7 +1877,8 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
 
 			ReportSlotInvalidation(invalidation_cause, false, active_pid,
 								   slotname, restart_lsn,
-								   oldestLSN, snapshotConflictHorizon);
+								   oldestLSN, snapshotConflictHorizon,
+								   inactive_since);
 
 			/* done with this slot for now */
 			break;
@@ -1776,6 +1901,7 @@ InvalidatePossiblyObsoleteSlot(ReplicationSlotInvalidationCause cause,
  * - RS_INVAL_HORIZON: requires a snapshot <= the given horizon in the given
  *   db; dboid may be InvalidOid for shared relations
  * - RS_INVAL_WAL_LEVEL: is logical
+ * - RS_INVAL_INACTIVE_TIMEOUT: inactive timeout occurs
  *
  * NB - this runs as part of checkpoint, so avoid raising errors if possible.
  */
@@ -1828,7 +1954,7 @@ restart:
 }
 
 /*
- * Flush all replication slots to disk.
+ * Flush all replication slots to disk and invalidate slots.
  *
  * It is convenient to flush dirty replication slots at the time of checkpoint.
  * Additionally, in case of a shutdown checkpoint, we also identify the slots
@@ -1839,6 +1965,7 @@ void
 CheckPointReplicationSlots(bool is_shutdown)
 {
 	int			i;
+	bool		invalidated = false;
 
 	elog(DEBUG1, "performing replication slot checkpoint");
 
@@ -1886,6 +2013,43 @@ CheckPointReplicationSlots(bool is_shutdown)
 		SaveSlotToPath(s, path, LOG);
 	}
 	LWLockRelease(ReplicationSlotAllocationLock);
+
+	elog(DEBUG1, "performing replication slot invalidation");
+
+	/*
+	 * Note that we will make another pass over replication slots for
+	 * invalidations to keep the code simple. The assumption here is that the
+	 * traversal over replication slots isn't that costly even with hundreds
+	 * of replication slots. If it ever turns out that this assumption is
+	 * wrong, we might have to put the invalidation check logic in the above
+	 * loop, for that we might have to do the following:
+	 *
+	 * - Acqure ControlLock lock once before the loop.
+	 *
+	 * - Call InvalidatePossiblyObsoleteSlot for each slot.
+	 *
+	 * - Handle the cases in which ControlLock gets released just like
+	 * InvalidateObsoleteReplicationSlots does.
+	 *
+	 * - Avoid saving slot info to disk two times for each invalidated slot.
+	 *
+	 * XXX: Should we move inactive_timeout inavalidation check closer to
+	 * wal_removed in CreateCheckPoint and CreateRestartPoint?
+	 */
+	invalidated = InvalidateObsoleteReplicationSlots(RS_INVAL_INACTIVE_TIMEOUT,
+													 0,
+													 InvalidOid,
+													 InvalidTransactionId);
+
+	if (invalidated)
+	{
+		/*
+		 * If any slots have been invalidated, recalculate the resource
+		 * limits.
+		 */
+		ReplicationSlotsComputeRequiredXmin(false);
+		ReplicationSlotsComputeRequiredLSN();
+	}
 }
 
 /*
