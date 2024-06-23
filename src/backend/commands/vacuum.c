@@ -47,6 +47,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/interrupt.h"
+#include "replication/slot.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
@@ -116,6 +117,7 @@ static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 static double compute_parallel_delay(void);
 static VacOptValue get_vacoptval_from_boolean(DefElem *def);
 static bool vac_tid_reaped(ItemPointer itemptr, void *state);
+static void try_replication_slot_invalidation(void);
 
 /*
  * GUC check function to ensure GUC value specified is within the allowable
@@ -453,6 +455,75 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 }
 
 /*
+ * Try invalidating replication slots based on current replication slot xmin
+ * limits once every vacuum cycle.
+ */
+static void
+try_replication_slot_invalidation(void)
+{
+	TransactionId min_slot_xmin;
+	TransactionId min_slot_catalog_xmin;
+	bool		can_invalidate = false;
+	TransactionId cutoff;
+	TransactionId curr;
+
+	curr = ReadNextTransactionId();
+
+	/*
+	 * The cutoff can tell how far we can go back from the current transaction
+	 * id till the age. And then, we check whether or not the xmin or
+	 * catalog_xmin falls within the cutoff; if yes, return true, otherwise
+	 * false.
+	 */
+	cutoff = curr - replication_slot_xid_age;
+
+	if (!TransactionIdIsNormal(cutoff))
+		cutoff = FirstNormalTransactionId;
+
+	ProcArrayGetReplicationSlotXmin(&min_slot_xmin, &min_slot_catalog_xmin);
+
+	/*
+	 * Current replication slot xmin limits can never be larger than the
+	 * current transaction id even in the case of transaction ID wraparound.
+	 */
+	Assert(min_slot_xmin <= curr);
+	Assert(min_slot_catalog_xmin <= curr);
+
+	if (TransactionIdIsNormal(min_slot_xmin) &&
+		TransactionIdPrecedesOrEquals(min_slot_xmin, cutoff))
+		can_invalidate = true;
+	else if (TransactionIdIsNormal(min_slot_catalog_xmin) &&
+			 TransactionIdPrecedesOrEquals(min_slot_catalog_xmin, cutoff))
+		can_invalidate = true;
+
+	if (can_invalidate)
+	{
+		bool		invalidated = false;
+
+		/*
+		 * Note that InvalidateObsoleteReplicationSlots is also called as part
+		 * of CHECKPOINT, and emitting ERRORs from within is avoided already.
+		 * Therefore, there is no concern here that any ERROR from
+		 * invalidating replication slots blocks VACUUM.
+		 */
+		invalidated = InvalidateObsoleteReplicationSlots(RS_INVAL_XID_AGE,
+														 0,
+														 InvalidOid,
+														 InvalidTransactionId);
+
+		if (invalidated)
+		{
+			/*
+			 * If any slots have been invalidated, recalculate the resource
+			 * limits.
+			 */
+			ReplicationSlotsComputeRequiredXmin(false);
+			ReplicationSlotsComputeRequiredLSN();
+		}
+	}
+}
+
+/*
  * Internal entry point for autovacuum and the VACUUM / ANALYZE commands.
  *
  * relations, if not NIL, is a list of VacuumRelation to process; otherwise,
@@ -483,6 +554,7 @@ vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 	const char *stmttype;
 	volatile bool in_outer_xact,
 				use_own_xacts;
+	static bool first_time = true;
 
 	Assert(params != NULL);
 
@@ -592,6 +664,14 @@ vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 
 		/* matches the StartTransaction in PostgresMain() */
 		CommitTransactionCommand();
+	}
+
+	if (params->options & VACOPT_VACUUM &&
+		first_time &&
+		replication_slot_xid_age > 0)
+	{
+		try_replication_slot_invalidation();
+		first_time = false;
 	}
 
 	/* Turn vacuum cost accounting on or off, and set/clear in_vacuum */
