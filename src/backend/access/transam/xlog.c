@@ -3182,6 +3182,18 @@ XLogNeedsFlush(XLogRecPtr record)
 	return true;
 }
 
+static char
+random_byte(void)
+{
+	char byte;
+
+	do {
+		byte = (char)(rand() % 256);
+	} while (byte == '\0'); /* Ensure the byte is non-zero */
+
+	return byte;
+}
+
 /*
  * Try to make a given XLOG file segment exist.
  *
@@ -3250,6 +3262,8 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 
 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_WRITE);
 	save_errno = 0;
+
+#if 0
 	if (wal_init_zero)
 	{
 		ssize_t		rc;
@@ -3269,7 +3283,24 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 			save_errno = errno;
 	}
 	else
+#endif
 	{
+		{
+			srand((unsigned int)time(NULL));
+
+			errno = 0;
+			for (off_t i = 0; i < wal_segment_size - 1; ++i)
+			{
+				char random_data = random_byte();
+
+				if (pg_pwrite(fd, &random_data, 1, i) != 1)
+				{
+					save_errno = errno ? errno : ENOSPC;
+					break;
+				}
+			}
+		}
+
 		/*
 		 * Otherwise, seeking to the end and writing a solitary byte is
 		 * enough.

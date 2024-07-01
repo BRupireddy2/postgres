@@ -977,6 +977,10 @@ XLogReadAhead(XLogReaderState *state, bool nonblocking)
 		return state->decode_queue_tail;
 	}
 
+#ifndef FRONTEND
+	elog(LOG, "ALICE: In XLogReadAhead() result %d", result);
+#endif
+
 	return NULL;
 }
 
