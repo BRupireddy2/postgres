@@ -3041,6 +3041,16 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"replication_slot_xid_age", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Age of the transaction ID at which a replication slot gets invalidated."),
+			gettext_noop("The transaction is the oldest transaction (including the one affecting the system catalogs) that a replication slot needs the database to retain.")
+		},
+		&replication_slot_xid_age,
+		0, 0, 2000000000,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"commit_delay", PGC_SUSET, WAL_SETTINGS,
 			gettext_noop("Sets the delay in microseconds between transaction commit and "
 						 "flushing WAL to disk."),
