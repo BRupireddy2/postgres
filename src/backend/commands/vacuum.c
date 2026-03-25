@@ -48,6 +48,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/interrupt.h"
+#include "replication/slot.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
@@ -1144,6 +1145,21 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams params,
 	/* Acquire next XID/next MXID values used to apply age-based settings */
 	nextXID = ReadNextTransactionId();
 	nextMXID = ReadNextMultiXactId();
+
+	/*
+	 * Try to invalidate XID-aged replication slots that may interfere with
+	 * vacuum's ability to freeze and remove dead tuples. Since OldestXmin
+	 * already covers the slot xmin/catalog_xmin values, pass it as a
+	 * preliminary check to avoid additional iteration over all the slots.
+	 *
+	 * If at least one slot was invalidated, recompute OldestXmin so that this
+	 * vacuum benefits from the advanced horizon immediately.
+	 */
+	if (InvalidateXIDAgedReplicationSlots(cutoffs->OldestXmin, nextXID))
+	{
+		cutoffs->OldestXmin = GetOldestNonRemovableTransactionId(rel);
+		Assert(TransactionIdIsNormal(cutoffs->OldestXmin));
+	}
 
 	/*
 	 * Also compute the multixact age for which freezing is urgent.  This is

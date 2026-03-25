@@ -540,4 +540,170 @@ is( $publisher4->safe_psql(
 $publisher4->stop;
 $subscriber4->stop;
 
+# Advance XIDs, run VACUUM, and wait for a slot to be invalidated due to XID age.
+sub invalidate_slot_by_xid_age
+{
+	my ($node, $table_name, $slot_name, $slot_type, $nxids) = @_;
+
+	# Do some work to advance xids
+	$node->safe_psql(
+		'postgres', qq[
+		do \$\$
+		begin
+		for i in 1..$nxids loop
+			-- use an exception block so that each iteration eats an XID
+			begin
+			insert into $table_name values (i);
+			exception
+			when division_by_zero then null;
+			end;
+		end loop;
+		end\$\$;
+	]);
+
+	# Trigger slot invalidation via VACUUM
+	$node->safe_psql('postgres', "VACUUM");
+
+	# Wait for the replication slot to be invalidated due to XID age.
+	$node->poll_query_until(
+		'postgres', qq[
+		SELECT COUNT(slot_name) = 1 FROM pg_replication_slots
+			WHERE slot_name = '$slot_name' AND
+			active = false AND
+			invalidation_reason = 'xid_aged';
+	])
+	  or die
+	  "Timed out while waiting for slot $slot_name to be invalidated";
+
+	ok(1, "$slot_type replication slot invalidated due to XID age");
+}
+
+# =============================================================================
+# Testcase start: Invalidate streaming standby's slot due to max_slot_xid_age
+# GUC.
+
+# Initialize primary node for XID age tests
+my $primary5 = PostgreSQL::Test::Cluster->new('primary5');
+$primary5->init(allows_streaming => 'logical');
+
+# Configure primary with XID age settings
+my $max_slot_xid_age = 500;
+$primary5->append_conf(
+	'postgresql.conf', qq{
+max_slot_xid_age = $max_slot_xid_age
+});
+
+$primary5->start;
+
+# Take a backup for creating standby
+$backup_name = 'backup5';
+$primary5->backup($backup_name);
+
+# Create a standby linking to the primary using the replication slot
+my $standby5 = PostgreSQL::Test::Cluster->new('standby5');
+$standby5->init_from_backup($primary5, $backup_name, has_streaming => 1);
+
+# Enable HS feedback. The slot should gain an xmin. We set the status interval
+# so we'll see the results promptly.
+$standby5->append_conf(
+	'postgresql.conf', q{
+primary_slot_name = 'sb5_slot'
+hot_standby_feedback = on
+wal_receiver_status_interval = 1
+max_standby_streaming_delay = 3600000
+});
+
+$primary5->safe_psql(
+	'postgres', qq[
+    SELECT pg_create_physical_replication_slot(slot_name := 'sb5_slot', immediately_reserve := true);
+]);
+
+$standby5->start;
+
+# Create some content on primary to move xmin
+$primary5->safe_psql('postgres',
+	"CREATE TABLE tab_int5 AS SELECT generate_series(1,10) AS a");
+
+# Wait until standby has replayed enough data
+$primary5->wait_for_catchup($standby5);
+
+$primary5->poll_query_until(
+	'postgres', qq[
+	SELECT (xmin IS NOT NULL) OR (catalog_xmin IS NOT NULL)
+		FROM pg_catalog.pg_replication_slots
+		WHERE slot_name = 'sb5_slot';
+]) or die "Timed out waiting for slot sb5_slot xmin to advance";
+
+# Read on standby that causes xmin to be held on slot
+my $standby5_session = $standby5->interactive_psql('postgres');
+$standby5_session->query("BEGIN; SET default_transaction_isolation = 'repeatable read'; SELECT * FROM tab_int5;");
+
+# Advance XIDs and wait for the slot to be invalidated due to XID age.
+# Use 2x the max_slot_xid_age to ensure the slot's xmin age comfortably
+# exceeds the configured limit.
+invalidate_slot_by_xid_age($primary5, 'tab_int5', 'sb5_slot', 'physical',
+	2 * $max_slot_xid_age);
+
+$standby5_session->quit;
+$standby5->stop;
+
+# Testcase end: Invalidate streaming standby's slot due to max_slot_xid_age
+# GUC.
+# =============================================================================
+
+# =============================================================================
+# Testcase start: Invalidate logical subscriber's slot due to max_slot_xid_age
+# GUC.
+
+# Create a subscriber node
+my $subscriber5 = PostgreSQL::Test::Cluster->new('subscriber5');
+$subscriber5->init(allows_streaming => 'logical');
+$subscriber5->start;
+
+# Create tables on both primary and subscriber
+$primary5->safe_psql('postgres', "CREATE TABLE test_tbl5 (id int)");
+$subscriber5->safe_psql('postgres', "CREATE TABLE test_tbl5 (id int)");
+
+# Insert some initial data
+$primary5->safe_psql('postgres',
+	"INSERT INTO test_tbl5 VALUES (generate_series(1, 5));");
+
+# Setup logical replication
+my $primary5_connstr = $primary5->connstr . ' dbname=postgres';
+$primary5->safe_psql('postgres',
+	"CREATE PUBLICATION pub5 FOR TABLE test_tbl5");
+
+$subscriber5->safe_psql('postgres',
+	"CREATE SUBSCRIPTION sub5 CONNECTION '$primary5_connstr' PUBLICATION pub5 WITH (slot_name = 'lsub5_slot')"
+);
+
+# Wait for initial sync to complete
+$subscriber5->wait_for_subscription_sync($primary5, 'sub5');
+
+$result = $subscriber5->safe_psql('postgres', "SELECT count(*) FROM test_tbl5");
+is($result, qq(5), "check initial copy was done for logical replication (XID age test)");
+
+# Wait for the logical slot to get catalog_xmin (logical slots use catalog_xmin, not xmin)
+$primary5->poll_query_until(
+	'postgres', qq[
+	SELECT xmin IS NULL AND catalog_xmin IS NOT NULL
+	FROM pg_catalog.pg_replication_slots
+	WHERE slot_name = 'lsub5_slot';
+]) or die "Timed out waiting for slot lsub5_slot catalog_xmin to advance";
+
+# Stop subscriber to make the replication slot on primary inactive
+$subscriber5->stop;
+
+# Advance XIDs and wait for the slot to be invalidated due to XID age.
+# Use 2x the max_slot_xid_age to ensure the slot's catalog_xmin age
+# comfortably exceeds the configured limit.
+invalidate_slot_by_xid_age($primary5, 'test_tbl5', 'lsub5_slot', 'logical',
+	2 * $max_slot_xid_age);
+
+$primary5->stop;
+
+# Testcase end: Invalidate logical subscriber's slot due to max_slot_xid_age
+# GUC.
+# =============================================================================
+
 done_testing();
