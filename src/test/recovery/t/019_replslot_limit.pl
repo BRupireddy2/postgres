@@ -703,4 +703,166 @@ $primary5->stop;
 # GUC.
 # =============================================================================
 
+# =============================================================================
+# Testcase: XID-age-based slot invalidation in a production-like scenario.
+# Standby sets slot xmin via HS feedback, disconnects, XIDs consumed.
+# Autovacuum automatically invalidates the slot once its xmin age exceeds
+# max_slot_xid_age, advances datfrozenxid in all databases, and keeps the
+# system healthy — no manual VACUUM, vacuumdb, or downtime needed.
+
+# Check if autovacuum has invalidated the slot due to xid_aged.
+# Returns 1 if invalidated, 0 otherwise.  Early exit when max_slot_xid_age = 0.
+sub check_slot_invalidated
+{
+	my ($node, $slot_name, $max_age, $consumed_xids) = @_;
+
+	return 0 if $max_age == 0;
+
+	my $reason = $node->safe_psql('postgres',
+		"SELECT invalidation_reason FROM pg_replication_slots WHERE slot_name = '$slot_name'");
+	if ($reason eq 'xid_aged')
+	{
+		diag "Slot invalidated by autovacuum after consuming $consumed_xids XIDs";
+		return 1;
+	}
+	return 0;
+}
+
+# Verify server log shows slot invalidation by autovacuum worker with
+# correct xmin, age, and next txid values.
+sub verify_slot_xid_aged_invalidation
+{
+	my ($node, $slot_name, $slot_xmin, $max_age, $consumed_xids) = @_;
+
+	my $log = slurp_file($node->logfile);
+
+	# Verify the invalidation was performed by an autovacuum worker.
+	like($log,
+		qr/autovacuum worker\[\d+\] LOG:\s+invalidating obsolete replication slot "$slot_name"/,
+		"server log: $slot_name invalidated by autovacuum worker");
+
+	# Verify DETAIL shows the correct xmin and max_slot_xid_age.
+	like($log,
+		qr/autovacuum worker\[\d+\] DETAIL:\s+The slot's xmin $slot_xmin at next transaction ID (\d+) exceeds the age $max_age specified by "max_slot_xid_age"/,
+		"server log: DETAIL shows xmin $slot_xmin and age $max_age");
+
+	# Extract next txid from the log and report for diagnostics.
+	$log =~
+	  /The slot's xmin $slot_xmin at next transaction ID (\d+) exceeds/;
+	my $log_next_txid = $1 // 'N/A';
+	diag "next_txid from server log=$log_next_txid, max_slot_xid_age=$max_age, consumed=$consumed_xids XIDs";
+}
+
+# Verify slot was invalidated and wait for autovacuum to advance datfrozenxid
+# in all databases.  Early exit when max_slot_xid_age = 0.
+sub verify_invalidation_and_recovery
+{
+	my ($node, $slot_name, $slot_xmin, $max_age, $consumed_xids, $slot_gone) = @_;
+
+	return if $max_age == 0;
+
+	ok($slot_gone, 'autovacuum invalidated slot due to xid_aged');
+
+	verify_slot_xid_aged_invalidation($node, $slot_name,
+		$slot_xmin, $max_age, $consumed_xids);
+
+	# Wait for autovacuum to advance datfrozenxid in all databases past the
+	# wraparound danger zone — no manual intervention required.
+	$node->poll_query_until(
+		'postgres', qq[
+		SELECT NOT EXISTS (
+			SELECT 1 FROM pg_database
+			WHERE age(datfrozenxid) > 2000000000
+		);
+	]) or die "Timed out waiting for autovacuum to advance datfrozenxid in all databases";
+}
+
+my $primary6 = PostgreSQL::Test::Cluster->new('primary6');
+$primary6->init(allows_streaming => 'logical');
+
+$max_slot_xid_age = 1600000000;    # matches vacuum_failsafe_age default
+$primary6->append_conf(
+	'postgresql.conf', qq{
+max_slot_xid_age = $max_slot_xid_age
+autovacuum_naptime = 1s
+});
+
+$primary6->start;
+$primary6->safe_psql('postgres', "CREATE EXTENSION xid_wraparound");
+
+$backup_name = 'backup6';
+$primary6->backup($backup_name);
+
+my $standby6 = PostgreSQL::Test::Cluster->new('standby6');
+$standby6->init_from_backup($primary6, $backup_name, has_streaming => 1);
+$standby6->append_conf(
+	'postgresql.conf', q{
+primary_slot_name = 'sb6_slot'
+hot_standby_feedback = on
+wal_receiver_status_interval = 1
+});
+
+$primary6->safe_psql('postgres',
+	"SELECT pg_create_physical_replication_slot('sb6_slot', true)");
+
+$standby6->start;
+
+$primary6->safe_psql('postgres',
+	"CREATE TABLE tab_int6 AS SELECT generate_series(1,10) AS a");
+$primary6->wait_for_catchup($standby6);
+
+$primary6->poll_query_until(
+	'postgres', qq[
+	SELECT xmin IS NOT NULL FROM pg_replication_slots
+		WHERE slot_name = 'sb6_slot';
+]) or die "Timed out waiting for sb6_slot xmin from HS feedback";
+
+$result = $primary6->safe_psql('postgres',
+	"SELECT xmin IS NOT NULL FROM pg_replication_slots WHERE slot_name = 'sb6_slot'");
+is($result, 't', 'slot has xmin from hot_standby_feedback');
+
+# Capture the slot's xmin for later log verification.
+my $slot_xmin = $primary6->safe_psql('postgres',
+	"SELECT xmin FROM pg_replication_slots WHERE slot_name = 'sb6_slot'");
+
+# Stop standby; slot xmin persists and holds back datfrozenxid.
+$standby6->stop;
+
+# Consume XIDs in 50M chunks.  Once we exceed max_slot_xid_age, autovacuum
+# (naptime=1s) should automatically invalidate the slot.  Keep consuming
+# until we see that happen — no manual VACUUM or downtime needed.
+my $logstart6 = -s $primary6->logfile;
+my $chunk = 50_000_000;
+my $max_xids = 2_200_000_000;
+my $consumed = 0;
+my $slot_gone = 0;
+
+while ($consumed < $max_xids)
+{
+	$primary6->safe_psql('postgres', "SELECT consume_xids($chunk)");
+	$consumed += $chunk;
+	my $remaining = $max_xids - $consumed;
+	diag "Consumed $consumed / $max_xids XIDs ($remaining remaining)";
+
+	if (!$slot_gone && check_slot_invalidated($primary6, 'sb6_slot',
+			$max_slot_xid_age, $consumed))
+	{
+		$slot_gone = 1;
+	}
+}
+
+verify_invalidation_and_recovery($primary6, 'sb6_slot',
+	$slot_xmin, $max_slot_xid_age, $consumed, $slot_gone);
+
+# Consume 1B more XIDs — combining with the 2.2B consumed above, the total
+# of 3.2B exceeds the 2^31 (~2.1B) usable XID space (xidStopLimit), i.e.
+# more than one full wraparound cycle, proving the system is healthy.
+$primary6->safe_psql('postgres', "SELECT consume_xids(1000000000)");
+ok(1, 'writes succeed after autovacuum invalidated the slot');
+
+$primary6->stop;
+
+# Testcase end: XID-age-based slot invalidation in a production-like scenario.
+# =============================================================================
+
 done_testing();
