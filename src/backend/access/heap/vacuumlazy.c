@@ -147,6 +147,7 @@
 #include "pgstat.h"
 #include "portability/instr_time.h"
 #include "postmaster/autovacuum.h"
+#include "replication/slot.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/latch.h"
@@ -799,6 +800,23 @@ heap_vacuum_rel(Relation rel, const VacuumParams params,
 	 * to increase the number of dead tuples it can prune away.)
 	 */
 	vacrel->aggressive = vacuum_get_cutoffs(rel, params, &vacrel->cutoffs);
+
+	/*
+	 * Try to invalidate XID-aged replication slots that may interfere with
+	 * vacuum's ability to freeze and remove dead tuples. Since OldestXmin
+	 * already covers the slot xmin/catalog_xmin values, pass it as a
+	 * preliminary check to avoid additional iteration over all the slots.
+	 *
+	 * If at least one slot was invalidated, recompute cutoffs so that this
+	 * vacuum benefits from the advanced horizon immediately.
+	 *
+	 * XXX: Next XID could be returned as output from vacuum_get_cutoffs() but
+	 * for now we live with an additional ReadNextTransactionId() call.
+	 */
+	if (InvalidateXIDAgedReplicationSlots(vacrel->cutoffs.OldestXmin,
+										  ReadNextTransactionId()))
+		vacrel->aggressive = vacuum_get_cutoffs(rel, params, &vacrel->cutoffs);
+
 	vacrel->rel_pages = orig_rel_pages = RelationGetNumberOfBlocks(rel);
 	vacrel->vistest = GlobalVisTestFor(rel);
 

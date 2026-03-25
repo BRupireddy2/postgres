@@ -4764,6 +4764,35 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-max-slot-xid-age" xreflabel="max_slot_xid_age">
+      <term><varname>max_slot_xid_age</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>max_slot_xid_age</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Invalidate replication slots whose <literal>xmin</literal> (the oldest
+        transaction that this slot needs the database to retain) or
+        <literal>catalog_xmin</literal> (the oldest transaction affecting the
+        system catalogs that this slot needs the database to retain) has reached
+        the age specified by this setting. This invalidation check happens
+        during vacuum (both <command>VACUUM</command> command and autovacuum).
+        A value of zero (which is default) disables this feature. Users can set
+        this value anywhere from zero to two billion. This parameter can only be
+        set in the <filename>postgresql.conf</filename> file or on the server
+        command line.
+       </para>
+
+       <para>
+        Idle or forgotten replication slots can hold back vacuum, leading to
+        bloat and eventually transaction ID wraparound. This setting avoids
+        that by invalidating slots that have fallen too far behind.
+        See <xref linkend="routine-vacuuming"/> for more details.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-wal-sender-timeout" xreflabel="wal_sender_timeout">
       <term><varname>wal_sender_timeout</varname> (<type>integer</type>)
       <indexterm>
