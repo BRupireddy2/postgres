@@ -384,7 +384,9 @@ extern void vac_update_relstats(Relation relation,
 								bool *minmulti_updated,
 								bool in_outer_xact);
 extern bool vacuum_get_cutoffs(Relation rel, const VacuumParams params,
-							   struct VacuumCutoffs *cutoffs);
+							   struct VacuumCutoffs *cutoffs,
+							   TransactionId *slot_xmin,
+							   TransactionId *slot_catalog_xmin);
 extern bool vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs);
 extern void vac_update_datfrozenxid(void);
 extern void vacuum_delay_point(bool is_analyze);

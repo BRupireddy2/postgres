@@ -1098,7 +1098,9 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
  */
 bool
 vacuum_get_cutoffs(Relation rel, const VacuumParams params,
-				   struct VacuumCutoffs *cutoffs)
+				   struct VacuumCutoffs *cutoffs,
+				   TransactionId *slot_xmin,
+				   TransactionId *slot_catalog_xmin)
 {
 	int			freeze_min_age,
 				multixact_freeze_min_age,
@@ -1133,7 +1135,9 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams params,
 	 * that only one vacuum process can be working on a particular table at
 	 * any time, and that each vacuum is always an independent transaction.
 	 */
-	cutoffs->OldestXmin = GetOldestNonRemovableTransactionId(rel);
+	cutoffs->OldestXmin = GetOldestNonRemovableTransactionIdExt(rel,
+																slot_xmin,
+																slot_catalog_xmin);
 
 	Assert(TransactionIdIsNormal(cutoffs->OldestXmin));
 

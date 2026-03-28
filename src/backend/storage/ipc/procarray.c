@@ -1951,9 +1951,28 @@ GlobalVisHorizonKindForRel(Relation rel)
 TransactionId
 GetOldestNonRemovableTransactionId(Relation rel)
 {
+	return GetOldestNonRemovableTransactionIdExt(rel, NULL, NULL);
+}
+
+/*
+ * Same as GetOldestNonRemovableTransactionId(), but also returns the
+ * replication slot xmin and catalog_xmin from the same ComputeXidHorizons()
+ * call.  This avoids a separate ProcArrayLock acquisition when the caller
+ * needs both values.
+ */
+TransactionId
+GetOldestNonRemovableTransactionIdExt(Relation rel,
+									  TransactionId *slot_xmin,
+									  TransactionId *slot_catalog_xmin)
+{
 	ComputeXidHorizonsResult horizons;
 
 	ComputeXidHorizons(&horizons);
+
+	if (slot_xmin)
+		*slot_xmin = horizons.slot_xmin;
+	if (slot_catalog_xmin)
+		*slot_catalog_xmin = horizons.slot_catalog_xmin;
 
 	switch (GlobalVisHorizonKindForRel(rel))
 	{

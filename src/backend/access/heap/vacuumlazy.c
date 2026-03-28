@@ -147,6 +147,7 @@
 #include "pgstat.h"
 #include "portability/instr_time.h"
 #include "postmaster/autovacuum.h"
+#include "replication/slot.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/latch.h"
@@ -642,6 +643,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams params,
 	ErrorContextCallback errcallback;
 	char	  **indnames = NULL;
 	Size		dead_items_max_bytes = 0;
+	TransactionId slot_xmin = InvalidTransactionId;
+	TransactionId slot_catalog_xmin = InvalidTransactionId;
 
 	verbose = (params.options & VACOPT_VERBOSE) != 0;
 	instrument = (verbose || (AmAutoVacuumWorkerProcess() &&
@@ -798,7 +801,22 @@ heap_vacuum_rel(Relation rel, const VacuumParams params,
 	 * want to teach lazy_scan_prune to recompute vistest from time to time,
 	 * to increase the number of dead tuples it can prune away.)
 	 */
-	vacrel->aggressive = vacuum_get_cutoffs(rel, params, &vacrel->cutoffs);
+	vacrel->aggressive = vacuum_get_cutoffs(rel, params, &vacrel->cutoffs,
+											&slot_xmin, &slot_catalog_xmin);
+
+	/*
+	 * Try to invalidate XID-aged replication slots. Use the slot xmin values
+	 * obtained from the same horizons computation that produced OldestXmin,
+	 * avoiding an extra ProcArrayLock acquisition.
+	 */
+	if (MaybeInvalidateXIDAgedSlots(slot_xmin, slot_catalog_xmin))
+	{
+		/* Recompute cutoffs after slot invalidation. */
+		vacrel->aggressive = vacuum_get_cutoffs(rel, params,
+												&vacrel->cutoffs,
+												NULL, NULL);
+	}
+
 	vacrel->rel_pages = orig_rel_pages = RelationGetNumberOfBlocks(rel);
 	vacrel->vistest = GlobalVisTestFor(rel);
 
