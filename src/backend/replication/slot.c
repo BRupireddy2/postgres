@@ -117,6 +117,7 @@ static const SlotInvalidationCauseMap SlotInvalidationCauses[] = {
 	{RS_INVAL_HORIZON, "rows_removed"},
 	{RS_INVAL_WAL_LEVEL, "wal_level_insufficient"},
 	{RS_INVAL_IDLE_TIMEOUT, "idle_timeout"},
+	{RS_INVAL_XID_AGE, "xid_aged"},
 };
 
 /*
@@ -157,6 +158,12 @@ int			max_replication_slots = 10; /* the maximum number of replication
  * duration; '0' disables it.
  */
 int			idle_replication_slot_timeout_secs = 0;
+
+/*
+ * Invalidate replication slots that have xmin or catalog_xmin older
+ * than the specified age; '0' disables it.
+ */
+int			max_slot_xid_age = 0;
 
 /*
  * This GUC lists streaming replication standby server slot names that
@@ -1780,7 +1787,10 @@ ReportSlotInvalidation(ReplicationSlotInvalidationCause cause,
 					   XLogRecPtr restart_lsn,
 					   XLogRecPtr oldestLSN,
 					   TransactionId snapshotConflictHorizon,
-					   long slot_idle_seconds)
+					   long slot_idle_seconds,
+					   TransactionId xmin,
+					   TransactionId catalog_xmin,
+					   TransactionId recentXid)
 {
 	StringInfoData err_detail;
 	StringInfoData err_hint;
@@ -1825,6 +1835,30 @@ ReportSlotInvalidation(ReplicationSlotInvalidationCause cause,
 								 "idle_replication_slot_timeout");
 				break;
 			}
+
+		case RS_INVAL_XID_AGE:
+			{
+				Assert(TransactionIdIsValid(xmin) || TransactionIdIsValid(catalog_xmin));
+
+				if (TransactionIdIsValid(xmin))
+				{
+					/* translator: %s is a GUC variable name */
+					appendStringInfo(&err_detail, _("The slot's xmin %u is %d transactions old, which exceeds the configured \"%s\" value of %d."),
+									 xmin, (int32) (recentXid - xmin), "max_slot_xid_age", max_slot_xid_age);
+				}
+				else
+				{
+					/* translator: %s is a GUC variable name */
+					appendStringInfo(&err_detail, _("The slot's catalog_xmin %u is %d transactions old, which exceeds the configured \"%s\" value of %d."),
+									 catalog_xmin, (int32) (recentXid - catalog_xmin), "max_slot_xid_age", max_slot_xid_age);
+				}
+
+				/* translator: %s is a GUC variable name */
+				appendStringInfo(&err_hint, _("You might need to increase \"%s\"."),
+								 "max_slot_xid_age");
+				break;
+			}
+
 		case RS_INVAL_NONE:
 			pg_unreachable();
 	}
@@ -1864,6 +1898,25 @@ CanInvalidateIdleSlot(ReplicationSlot *s)
 }
 
 /*
+ * Can we invalidate an XID-aged replication slot?
+ *
+ * XID-aged based invalidation is allowed to the given slot when:
+ *
+ * 1. Max XID-age is set
+ * 2. Slot has valid xmin or catalog_xmin
+ * 3. The slot is not being synced from the primary while the server is in
+ *	  recovery.
+ */
+static inline bool
+CanInvalidateXidAgedSlot(ReplicationSlot *s)
+{
+	return (max_slot_xid_age != 0 &&
+			(TransactionIdIsValid(s->data.xmin) ||
+			 TransactionIdIsValid(s->data.catalog_xmin)) &&
+			!(RecoveryInProgress() && s->data.synced));
+}
+
+/*
  * DetermineSlotInvalidationCause - Determine the cause for which a slot
  * becomes invalid among the given possible causes.
  *
@@ -1874,6 +1927,7 @@ static ReplicationSlotInvalidationCause
 DetermineSlotInvalidationCause(uint32 possible_causes, ReplicationSlot *s,
 							   XLogRecPtr oldestLSN, Oid dboid,
 							   TransactionId snapshotConflictHorizon,
+							   TransactionId xidLimit,
 							   TimestampTz *inactive_since, TimestampTz now)
 {
 	Assert(possible_causes != RS_INVAL_NONE);
@@ -1945,6 +1999,18 @@ DetermineSlotInvalidationCause(uint32 possible_causes, ReplicationSlot *s,
 		}
 	}
 
+	/* Check if the slot needs to be invalidated due to max_slot_xid_age GUC */
+	if ((possible_causes & RS_INVAL_XID_AGE) && CanInvalidateXidAgedSlot(s))
+	{
+		Assert(TransactionIdIsValid(xidLimit));
+
+		if ((TransactionIdIsValid(s->data.xmin) &&
+			 TransactionIdPrecedes(s->data.xmin, xidLimit)) ||
+			(TransactionIdIsValid(s->data.catalog_xmin) &&
+			 TransactionIdPrecedes(s->data.catalog_xmin, xidLimit)))
+			return RS_INVAL_XID_AGE;
+	}
+
 	return RS_INVAL_NONE;
 }
 
@@ -1967,12 +2033,19 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
 							   ReplicationSlot *s,
 							   XLogRecPtr oldestLSN,
 							   Oid dboid, TransactionId snapshotConflictHorizon,
+							   TransactionId recentXid,
 							   bool *released_lock_out)
 {
 	int			last_signaled_pid = 0;
 	bool		released_lock = false;
 	bool		invalidated = false;
 	TimestampTz inactive_since = 0;
+	TransactionId xidLimit = InvalidTransactionId;
+
+	/* Compute the XID limit once, to avoid redundant work per slot */
+	if ((possible_causes & RS_INVAL_XID_AGE) &&
+		TransactionIdIsValid(recentXid))
+		xidLimit = TransactionIdRetreatedBy(recentXid, max_slot_xid_age);
 
 	for (;;)
 	{
@@ -2019,6 +2092,7 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
 																s, oldestLSN,
 																dboid,
 																snapshotConflictHorizon,
+																xidLimit,
 																&inactive_since,
 																now);
 
@@ -2112,7 +2186,8 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
 				ReportSlotInvalidation(invalidation_cause, true, active_pid,
 									   slotname, restart_lsn,
 									   oldestLSN, snapshotConflictHorizon,
-									   slot_idle_secs);
+									   slot_idle_secs, s->data.xmin,
+									   s->data.catalog_xmin, recentXid);
 
 				if (MyBackendType == B_STARTUP)
 					(void) SignalRecoveryConflict(GetPGProcByNumber(active_proc),
@@ -2165,7 +2240,8 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
 			ReportSlotInvalidation(invalidation_cause, false, active_pid,
 								   slotname, restart_lsn,
 								   oldestLSN, snapshotConflictHorizon,
-								   slot_idle_secs);
+								   slot_idle_secs, s->data.xmin,
+								   s->data.catalog_xmin, recentXid);
 
 			/* done with this slot for now */
 			break;
@@ -2192,6 +2268,8 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
  *   logical.
  * - RS_INVAL_IDLE_TIMEOUT: has been idle longer than the configured
  *   "idle_replication_slot_timeout" duration.
+ * - RS_INVAL_XID_AGE: slot xid age is older than the configured
+ *   "max_slot_xid_age" age.
  *
  * Note: This function attempts to invalidate the slot for multiple possible
  * causes in a single pass, minimizing redundant iterations. The "cause"
@@ -2205,7 +2283,8 @@ InvalidatePossiblyObsoleteSlot(uint32 possible_causes,
 bool
 InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 								   XLogSegNo oldestSegno, Oid dboid,
-								   TransactionId snapshotConflictHorizon)
+								   TransactionId snapshotConflictHorizon,
+								   TransactionId recentXid)
 {
 	XLogRecPtr	oldestLSN;
 	bool		invalidated = false;
@@ -2244,7 +2323,7 @@ restart:
 
 		if (InvalidatePossiblyObsoleteSlot(possible_causes, s, oldestLSN,
 										   dboid, snapshotConflictHorizon,
-										   &released_lock))
+										   recentXid, &released_lock))
 		{
 			Assert(released_lock);
 
@@ -3274,4 +3353,45 @@ WaitForStandbyConfirmation(XLogRecPtr wait_for_lsn)
 	}
 
 	ConditionVariableCancelSleep();
+}
+
+/*
+ * Invalidate replication slots whose XID age exceeds the max_slot_xid_age
+ * GUC.
+ *
+ * The slot_xmin and slot_catalog_xmin are the replication slot xmin values
+ * obtained from the same ComputeXidHorizons() call that computed OldestXmin
+ * during vacuum. Using these avoids a separate ProcArrayLock acquisition.
+ *
+ * Returns true if at least one slot was invalidated.
+ */
+bool
+MaybeInvalidateXIDAgedSlots(TransactionId slot_xmin,
+							TransactionId slot_catalog_xmin)
+{
+	TransactionId recentXid;
+	TransactionId xidLimit;
+	bool		invalidated = false;
+
+	if (max_slot_xid_age == 0)
+		return false;
+
+	recentXid = ReadNextTransactionId();
+	xidLimit = TransactionIdRetreatedBy(recentXid, max_slot_xid_age);
+
+	/*
+	 * Invalidate possibly obsolete slots based on XID-age, if either slot's
+	 * xmin or catalog_xmin is older than the cutoff.
+	 */
+	if ((TransactionIdIsValid(slot_xmin) &&
+		 TransactionIdPrecedes(slot_xmin, xidLimit)) ||
+		(TransactionIdIsValid(slot_catalog_xmin) &&
+		 TransactionIdPrecedes(slot_catalog_xmin, xidLimit)))
+		invalidated = InvalidateObsoleteReplicationSlots(RS_INVAL_XID_AGE,
+														 0,
+														 InvalidOid,
+														 InvalidTransactionId,
+														 recentXid);
+
+	return invalidated;
 }
