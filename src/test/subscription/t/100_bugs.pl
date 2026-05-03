@@ -23,6 +23,9 @@ my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
+my $injection_points_supported =
+  $node_publisher->check_extension('injection_points');
+
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init;
 $node_subscriber->start;
@@ -604,5 +607,73 @@ like(
 $node_publisher->safe_psql('postgres', "DROP DATABASE regress_db");
 
 $node_publisher->stop('fast');
+
+# BUG: pg_get_publication_tables() race with concurrent DROP TABLE.
+#
+# pg_get_publication_tables() collects table OIDs without locks on the first
+# call, then opens each table on subsequent calls. If a table is dropped in
+# between, the function errors with "could not open relation with OID".
+if ($injection_points_supported != 0)
+{
+	# Disable parallel query so the injection point fires only in the client
+	# backend.
+	$node_publisher->append_conf('postgresql.conf',
+		"shared_preload_libraries = 'injection_points'
+		 debug_parallel_query = off");
+	$node_publisher->start();
+
+	my $pub_db = 'concurrent_drop_table_db';
+
+	$node_publisher->safe_psql('postgres', "CREATE DATABASE $pub_db");
+
+	$node_publisher->safe_psql(
+		$pub_db, qq{
+		CREATE EXTENSION injection_points;
+		CREATE PUBLICATION pub_all FOR ALL TABLES;
+		CREATE TABLE t_dropme (id int, data text);
+	});
+
+	# Pause pg_get_publication_tables() after building the table OID list.
+	$node_publisher->safe_psql($pub_db,
+		"SELECT injection_points_attach('pg-get-publication-tables-after-list-built', 'wait');"
+	);
+
+	# Background session queries pg_publication_tables view; it will block at
+	# the injection point.
+	my $bgpsql =
+	  $node_publisher->background_psql($pub_db, on_error_stop => 0);
+	$bgpsql->query_until(
+		qr/querying_publication_tables/,
+		qq{\\echo querying_publication_tables
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'pub_all';
+});
+
+	$node_publisher->wait_for_event('client backend',
+		'pg-get-publication-tables-after-list-built');
+
+	# Drop the table while pg_get_publication_tables() is paused with injection
+	# point.
+	$node_publisher->safe_psql($pub_db, "DROP TABLE t_dropme");
+
+	# Resume and detach.
+	$node_publisher->safe_psql($pub_db,
+		"SELECT injection_points_wakeup('pg-get-publication-tables-after-list-built');
+		 SELECT injection_points_detach('pg-get-publication-tables-after-list-built');"
+	);
+
+	# Verify the background session completed without error.
+	my (undef, $bg_err) = $bgpsql->query("SELECT 1");
+	$bgpsql->quit;
+
+	is($bg_err, 0,
+		"pg_publication_tables handles concurrently dropped tables");
+
+	# Cleanup.
+	$node_publisher->safe_psql($pub_db, "DROP PUBLICATION pub_all");
+	$node_publisher->safe_psql($pub_db, "DROP EXTENSION injection_points");
+	$node_publisher->safe_psql('postgres', "DROP DATABASE $pub_db");
+
+	$node_publisher->stop('fast');
+}
 
 done_testing();
