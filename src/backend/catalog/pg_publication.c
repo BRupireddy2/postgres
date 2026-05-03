@@ -36,6 +36,7 @@
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -47,6 +48,13 @@ typedef struct
 	Oid			pubid;			/* OID of publication that publishes this
 								 * table. */
 } published_rel;
+
+/* State for pg_get_publication_tables SRF */
+typedef struct
+{
+	List	   *table_infos;	/* list of published_rel */
+	int			curr_idx;		/* current index into table_infos */
+} publication_tables_state;
 
 /*
  * Check if relation can be in given publication and throws appropriate
@@ -1408,13 +1416,14 @@ pg_get_publication_tables(FunctionCallInfo fcinfo, ArrayType *pubnames,
 {
 #define NUM_PUBLICATION_TABLES_ELEM	4
 	FuncCallContext *funcctx;
-	List	   *table_infos = NIL;
+	publication_tables_state *ptstate;
 
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
 	{
 		TupleDesc	tupdesc;
 		MemoryContext oldcontext;
+		List	   *table_infos = NIL;
 		Datum	   *elems;
 		int			nelems,
 					i;
@@ -1537,25 +1546,41 @@ pg_get_publication_tables(FunctionCallInfo fcinfo, ArrayType *pubnames,
 
 		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-		funcctx->user_fctx = table_infos;
+
+		/* Store the state to be used across SRF calls. */
+		ptstate = palloc_object(publication_tables_state);
+		ptstate->table_infos = table_infos;
+		ptstate->curr_idx = 0;
+		funcctx->user_fctx = ptstate;
 
 		MemoryContextSwitchTo(oldcontext);
+
+		elog(LOG, "pg_get_publication_tables: about to hit injection point, num_tables=%d",
+			 list_length(table_infos));
+		INJECTION_POINT("pg-get-publication-tables-after-list-built", NULL);
+		elog(LOG, "pg_get_publication_tables: returned from injection point");
 	}
 
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
-	table_infos = (List *) funcctx->user_fctx;
+	ptstate = (publication_tables_state *) funcctx->user_fctx;
 
-	if (funcctx->call_cntr < list_length(table_infos))
+	while (ptstate->curr_idx < list_length(ptstate->table_infos))
 	{
 		HeapTuple	pubtuple = NULL;
 		HeapTuple	rettuple;
 		Publication *pub;
-		published_rel *table_info = (published_rel *) list_nth(table_infos, funcctx->call_cntr);
+		published_rel *table_info = (published_rel *) list_nth(ptstate->table_infos, ptstate->curr_idx);
 		Oid			relid = table_info->relid;
 		Oid			schemaid = get_rel_namespace(relid);
 		Datum		values[NUM_PUBLICATION_TABLES_ELEM] = {0};
 		bool		nulls[NUM_PUBLICATION_TABLES_ELEM] = {0};
+
+		ptstate->curr_idx++;
+
+		/* Skip if the relation has been concurrently dropped. */
+		if (!OidIsValid(schemaid))
+			continue;
 
 		/*
 		 * Form tuple with appropriate data.
@@ -1599,11 +1624,17 @@ pg_get_publication_tables(FunctionCallInfo fcinfo, ArrayType *pubnames,
 		/* Show all columns when the column list is not specified. */
 		if (nulls[2])
 		{
-			Relation	rel = table_open(relid, AccessShareLock);
+			Relation	rel = try_table_open(relid, AccessShareLock);
 			int			nattnums = 0;
 			int16	   *attnums;
-			TupleDesc	desc = RelationGetDescr(rel);
+			TupleDesc	desc;
 			int			i;
+
+			/* Skip if the relation has been concurrently dropped. */
+			if (rel == NULL)
+				continue;
+
+			desc = RelationGetDescr(rel);
 
 			attnums = palloc_array(int16, desc->natts);
 

@@ -254,11 +254,22 @@ injection_wait(const char *name, const void *private_data, void *arg)
 	uint32		injection_wait_event = 0;
 	const InjectionPointCondition *condition = private_data;
 
+	if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+		elog(LOG, "injection_wait: entered for injection point '%s'", name);
+
 	if (inj_state == NULL)
 		injection_init_shmem();
 
 	if (!injection_point_allowed(condition))
+	{
+		if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+			elog(LOG, "injection_wait: condition not allowed for '%s', condition_type=%d, condition_pid=%d",
+				 name, condition->type, condition->pid);
 		return;
+	}
+
+	if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+		elog(LOG, "injection_wait: condition allowed for '%s', registering wait event", name);
 
 	/*
 	 * Use the injection point name for this custom wait event.  Note that
@@ -266,6 +277,10 @@ injection_wait(const char *name, const void *private_data, void *arg)
 	 * testing as this should be short-lived.
 	 */
 	injection_wait_event = WaitEventInjectionPointNew(name);
+
+	if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+		elog(LOG, "injection_wait: wait event registered for '%s', wait_event_id=0x%08x",
+			 name, injection_wait_event);
 
 	/*
 	 * Find a free slot to wait for, and register this injection point's name.
@@ -287,6 +302,10 @@ injection_wait(const char *name, const void *private_data, void *arg)
 		elog(ERROR, "could not find free slot for wait of injection point %s ",
 			 name);
 
+	if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+		elog(LOG, "injection_wait: about to sleep for '%s', slot=%d, old_wait_counts=%u",
+			 name, index, old_wait_counts);
+
 	/* And sleep.. */
 	ConditionVariablePrepareToSleep(&inj_state->wait_point);
 	for (;;)
@@ -302,6 +321,9 @@ injection_wait(const char *name, const void *private_data, void *arg)
 		ConditionVariableSleep(&inj_state->wait_point, injection_wait_event);
 	}
 	ConditionVariableCancelSleep();
+
+	if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+		elog(LOG, "injection_wait: woke up from '%s'", name);
 
 	/* Remove this injection point from the waiters. */
 	SpinLockAcquire(&inj_state->lock);

@@ -7,6 +7,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 # Bug #15114
 
@@ -22,6 +23,9 @@ use Test::More;
 my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
+
+my $injection_points_supported =
+  $node_publisher->check_extension('injection_points');
 
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init;
@@ -604,5 +608,164 @@ like(
 $node_publisher->safe_psql('postgres', "DROP DATABASE regress_db");
 
 $node_publisher->stop('fast');
+
+# BUG: pg_get_publication_tables() race with concurrent DROP TABLE.
+#
+# pg_get_publication_tables() collects table OIDs without locks on the first
+# call, then opens each table on subsequent calls. If a table is dropped in
+# between, the function errors with "could not open relation with OID".
+if ($injection_points_supported != 0)
+{
+	$node_publisher->append_conf('postgresql.conf',
+		"shared_preload_libraries = 'injection_points'");
+	$node_publisher->append_conf('postgresql.conf',
+		"log_min_messages = debug1");
+	$node_publisher->start();
+
+	my $pub_db = 'regress_pub_drop_db';
+
+	$node_publisher->safe_psql('postgres', "CREATE DATABASE $pub_db");
+
+	$node_publisher->safe_psql(
+		$pub_db, qq{
+		CREATE EXTENSION injection_points;
+		CREATE PUBLICATION pub_all FOR ALL TABLES;
+		CREATE TABLE t_dropme (id int, data text);
+	});
+
+	diag("DEBUG: About to attach injection point 'pg-get-publication-tables-after-list-built'");
+
+	# Pause pg_get_publication_tables() after building the table OID list.
+	$node_publisher->safe_psql($pub_db,
+		"SELECT injection_points_attach('pg-get-publication-tables-after-list-built', 'wait');"
+	);
+
+	diag("DEBUG: Injection point attached successfully");
+
+	# Verify the injection point is indeed attached
+	my $inj_list = $node_publisher->safe_psql($pub_db,
+		"SELECT * FROM injection_points_list();");
+	diag("DEBUG: Currently attached injection points: $inj_list");
+
+	# Background session queries pg_publication_tables view; it will block at
+	# the injection point.
+	my $bgpsql =
+	  $node_publisher->background_psql($pub_db, on_error_stop => 0);
+
+	diag("DEBUG: About to send query to background psql session");
+
+	$bgpsql->query_until(
+		qr/querying_publication_tables/,
+		qq{\\echo querying_publication_tables
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'pub_all';
+});
+
+	diag("DEBUG: Background psql sent query, now waiting for wait event");
+
+	# Dump pg_stat_activity before waiting
+	my $activity_before = $node_publisher->safe_psql('postgres', qq{
+		SELECT pid, backend_type, state, wait_event_type, wait_event, query
+		FROM pg_stat_activity
+		WHERE datname = '$pub_db' OR backend_type = 'client backend'
+		ORDER BY pid;
+	});
+	diag("DEBUG: pg_stat_activity BEFORE wait_for_event:\n$activity_before");
+
+	# Use poll_query_until with more diagnostic info instead of wait_for_event
+	my $max_polls = 300;  # 30 seconds with 100ms sleep
+	my $poll_count = 0;
+	my $found_event = 0;
+
+	while ($poll_count < $max_polls)
+	{
+		my $result = $node_publisher->safe_psql('postgres', qq{
+			SELECT count(*) FROM pg_stat_activity
+			WHERE backend_type = 'client backend'
+			  AND wait_event = 'pg-get-publication-tables-after-list-built';
+		});
+
+		if ($result eq '1' || $result > 0)
+		{
+			$found_event = 1;
+			diag("DEBUG: Found wait event after $poll_count polls");
+			last;
+		}
+
+		# Every 10 polls, dump state for debugging
+		if ($poll_count % 10 == 0 && $poll_count > 0)
+		{
+			my $activity_poll = $node_publisher->safe_psql('postgres', qq{
+				SELECT pid, backend_type, state, wait_event_type, wait_event, left(query, 80) as query
+				FROM pg_stat_activity
+				WHERE datname = '$pub_db' OR backend_type = 'client backend'
+				ORDER BY pid;
+			});
+			diag("DEBUG: pg_stat_activity at poll $poll_count:\n$activity_poll");
+
+			# Also check server log for injection point messages
+			my $log_contents = $node_publisher->log_content();
+			my @inj_lines = grep { /injection_wait:|pg_get_publication_tables:/ } split(/\n/, $log_contents);
+			if (@inj_lines)
+			{
+				my $last_lines = join("\n", @inj_lines[-10..-1]) if @inj_lines >= 10;
+				$last_lines = join("\n", @inj_lines) if @inj_lines < 10;
+				diag("DEBUG: Relevant log lines at poll $poll_count:\n$last_lines");
+			}
+		}
+
+		$poll_count++;
+		usleep(100_000);  # 100ms
+	}
+
+	if (!$found_event)
+	{
+		# Final diagnostic dump before failing
+		my $activity_final = $node_publisher->safe_psql('postgres', qq{
+			SELECT pid, backend_type, state, wait_event_type, wait_event, query
+			FROM pg_stat_activity
+			ORDER BY pid;
+		});
+		diag("DEBUG: FINAL pg_stat_activity (event NOT found after $poll_count polls):\n$activity_final");
+
+		# Dump all injection-point related log lines
+		my $log_contents = $node_publisher->log_content();
+		my @inj_lines = grep { /injection_wait:|pg_get_publication_tables:|injection_point/ } split(/\n/, $log_contents);
+		diag("DEBUG: All injection-related log lines:\n" . join("\n", @inj_lines));
+
+		die "timed out when waiting for client backend to reach wait event 'pg-get-publication-tables-after-list-built' after $poll_count polls";
+	}
+
+	diag("DEBUG: Wait event found, now dropping table");
+
+	# Drop the table while pg_get_publication_tables() is paused with injection
+	# point.
+	$node_publisher->safe_psql($pub_db, "DROP TABLE t_dropme");
+
+	diag("DEBUG: Table dropped, now waking up injection point");
+
+	# Resume and detach.
+	$node_publisher->safe_psql($pub_db,
+		"SELECT injection_points_wakeup('pg-get-publication-tables-after-list-built');
+		 SELECT injection_points_detach('pg-get-publication-tables-after-list-built');"
+	);
+
+	diag("DEBUG: Injection point woken up and detached");
+
+	# Verify the background session completed without error.
+	my (undef, $bg_err) = $bgpsql->query("SELECT 1");
+	$bgpsql->quit;
+
+	is($bg_err, 0,
+		"pg_publication_tables handles concurrently dropped tables");
+
+	diag("DEBUG: Test completed, bg_err=$bg_err");
+
+	# Cleanup.
+	$node_publisher->safe_psql($pub_db, "DROP PUBLICATION pub_all");
+	$node_publisher->safe_psql($pub_db, "DROP EXTENSION injection_points");
+	$node_publisher->safe_psql('postgres', "DROP DATABASE $pub_db");
+
+	$node_publisher->stop('fast');
+}
 
 done_testing();

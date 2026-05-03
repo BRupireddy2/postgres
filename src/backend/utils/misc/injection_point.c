@@ -535,7 +535,19 @@ InjectionPointRun(const char *name, void *arg)
 
 	cache_entry = InjectionPointCacheRefresh(name);
 	if (cache_entry)
+	{
+		if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+			elog(LOG, "InjectionPointRun: about to execute callback for '%s'",
+				 name);
 		cache_entry->callback(name, cache_entry->private_data, arg);
+		if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+			elog(LOG, "InjectionPointRun: callback returned for '%s'", name);
+	}
+	else
+	{
+		if (strcmp(name, "pg-get-publication-tables-after-list-built") == 0)
+			elog(LOG, "InjectionPointRun: no cache entry found for '%s'", name);
+	}
 #else
 	elog(ERROR, "Injection points are not supported by this build");
 #endif
