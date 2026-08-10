@@ -42,10 +42,14 @@ my $consume_xid_proc = qq{
 
 my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 'logical');
+# Autovacuum stays off until the testcase that needs it, so its naptime and
+# logging are set here and turning it on then needs only a reload.
 $primary->append_conf(
 	'postgresql.conf', qq{
 max_slot_xid_age = $slot_xid_age
 autovacuum = off
+autovacuum_naptime = 1s
+log_autovacuum_min_duration = 0
 checkpoint_timeout = 1h
 });
 $primary->start;
@@ -58,9 +62,10 @@ $primary->backup($backup_name);
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($primary, $backup_name, has_streaming => 1);
 
-# Testcase 1: an active physical slot (aged xmin) is invalidated at a
-# checkpoint. A running standby keeps the slot active; an open transaction
-# there, reported via feedback, freezes its xmin.
+# Testcase 1: an active physical slot (aged xmin) is skipped by the VACUUM
+# command, which never blocks on an active slot, and invalidated at a
+# checkpoint. A running standby keeps the slot active, with an open transaction
+# there, reported via feedback, freezing its xmin.
 $primary->safe_psql('postgres',
 	"SELECT pg_create_physical_replication_slot('phys_slot_a', true)");
 
@@ -91,6 +96,14 @@ my $held = $standby->background_psql('postgres');
 $held->query_safe("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;");
 
 $primary->safe_psql('postgres', qq{CALL consume_xid(2 * $slot_xid_age)});
+
+$primary->safe_psql('postgres', "VACUUM tbl_user");
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT invalidation_reason IS NULL AND active FROM pg_replication_slots WHERE slot_name = 'phys_slot_a';]
+	),
+	't',
+	'active physical slot not invalidated by VACUUM');
 
 # The checkpoint invalidates the slot
 $primary->safe_psql('postgres', "CHECKPOINT");
@@ -173,6 +186,130 @@ $standby->safe_psql('postgres', "CHECKPOINT");
 wait_for_xid_aged_invalidation($standby, 'logical_standby_slot');
 
 $standby->stop;
+
+# Testcase 4: an inactive logical slot (aged catalog_xmin) is invalidated by
+# vacuuming a system catalog, whose cutoff includes catalog_xmin. VACUUM is in
+# the foreground and the slot is inactive, so it is invalidated synchronously.
+$primary->safe_psql('postgres',
+	"SELECT pg_create_logical_replication_slot('logical_slot_a', 'pgoutput')"
+);
+$primary->poll_query_until(
+	'postgres', qq[
+	SELECT catalog_xmin IS NOT NULL FROM pg_replication_slots
+		WHERE slot_name = 'logical_slot_a';
+]) or die "Timed out waiting for slot logical_slot_a catalog_xmin";
+
+$primary->safe_psql('postgres', qq{CALL consume_xid(2 * $slot_xid_age)});
+
+$primary->safe_psql('postgres', "VACUUM pg_class");
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT invalidation_reason = 'xid_aged' FROM pg_replication_slots WHERE slot_name = 'logical_slot_a';]
+	),
+	't',
+	'inactive logical slot invalidated by vacuuming a system catalog');
+
+# Testcase 5: with an aged physical slot (xmin) and an aged logical slot
+# (catalog_xmin) both present, vacuuming a user table invalidates only the
+# physical slot. A user table's cutoff uses xmin, not catalog_xmin, so the
+# logical slot is not considered. Vacuuming a system catalog then invalidates
+# it.
+$primary->safe_psql('postgres',
+	"SELECT pg_create_logical_replication_slot('logical_slot_b', 'pgoutput')"
+);
+$primary->poll_query_until(
+	'postgres', qq[
+	SELECT catalog_xmin IS NOT NULL FROM pg_replication_slots
+		WHERE slot_name = 'logical_slot_b';
+]) or die "Timed out waiting for slot logical_slot_b catalog_xmin";
+
+# hs_feedback gives the physical slot an xmin, and stopping the standby
+# freezes it.
+$standby->adjust_conf('postgresql.conf', 'hot_standby_feedback', 'on');
+$standby->start;
+$primary->wait_for_catchup($standby);
+
+$primary->poll_query_until(
+	'postgres', qq[
+	SELECT xmin IS NOT NULL FROM pg_replication_slots
+		WHERE slot_name = 'phys_slot_b';
+]) or die "Timed out waiting for slot phys_slot_b xmin from hs_feedback";
+
+$standby->stop;
+
+$primary->safe_psql('postgres', qq{CALL consume_xid(2 * $slot_xid_age)});
+
+# Remember what the slot holds the cutoff at, before invalidation clears it.
+# The vacuum below starts out with this xmin as its cutoff.
+my $slot_xmin = $primary->safe_psql('postgres',
+	qq[SELECT xmin FROM pg_replication_slots WHERE slot_name = 'phys_slot_b';]
+);
+
+$primary->safe_psql('postgres', "VACUUM tbl_user");
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT invalidation_reason = 'xid_aged' FROM pg_replication_slots WHERE slot_name = 'phys_slot_b';]
+	),
+	't',
+	'physical slot invalidated by vacuuming a user table');
+
+# The vacuum that invalidated the slot recomputes its cutoff, so it freezes
+# past the xmin the slot was holding rather than stopping there.
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT age(relfrozenxid) < age('$slot_xmin'::xid) FROM pg_class WHERE relname = 'tbl_user';]
+	),
+	't',
+	'vacuum advances relfrozenxid past the invalidated slot xmin');
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT invalidation_reason IS NULL FROM pg_replication_slots WHERE slot_name = 'logical_slot_b';]
+	),
+	't',
+	'logical slot not invalidated by vacuuming a user table');
+
+$primary->safe_psql('postgres', "VACUUM pg_class");
+is( $primary->safe_psql(
+		'postgres',
+		qq[SELECT invalidation_reason = 'xid_aged' FROM pg_replication_slots WHERE slot_name = 'logical_slot_b';]
+	),
+	't',
+	'logical slot invalidated by vacuuming a system catalog');
+
+# Testcase 6: an inactive physical slot (aged xmin) is invalidated by
+# autovacuum.
+#
+# A fresh physical slot for the standby, since the previous one was
+# invalidated.
+$primary->safe_psql('postgres',
+	"SELECT pg_create_physical_replication_slot('phys_slot_c', true)");
+$standby->adjust_conf('postgresql.conf', 'primary_slot_name',
+	"'phys_slot_c'");
+$standby->start;
+$primary->wait_for_catchup($standby);
+
+$primary->poll_query_until(
+	'postgres', qq[
+	SELECT xmin IS NOT NULL FROM pg_replication_slots
+		WHERE slot_name = 'phys_slot_c';
+]) or die "Timed out waiting for slot phys_slot_c xmin from hs_feedback";
+
+$standby->stop;
+
+$primary->safe_psql('postgres', qq{CALL consume_xid(2 * $slot_xid_age)});
+
+# Turn autovacuum on. The dead tuples only give a worker a reason to vacuum;
+# the age check happens in any vacuum, whatever relation it runs on.
+$primary->adjust_conf('postgresql.conf', 'autovacuum', 'on');
+$primary->reload;
+$primary->safe_psql(
+	'postgres', q{
+	CREATE TABLE tbl_dead (a int);
+	INSERT INTO tbl_dead SELECT generate_series(1, 10000);
+	DELETE FROM tbl_dead;
+});
+wait_for_xid_aged_invalidation($primary, 'phys_slot_c');
+
 $primary->stop;
 
 done_testing();
